@@ -1,25 +1,26 @@
 import qhue
-from hue_lamp import HueLamp
 import os
+from pkg_resources import resource_filename
 
-BRIDGE_IP = '192.168.2.3'
-UNAME_FILE = 'bridge_username.txt'
+_bridge_ip = '192.168.2.3'
+_uname_file = 'bridge_username.txt'
+_uname_file_location = resource_filename(__name__, _uname_file)
 
-def start():
+def quickstart():
 
-    if not os.path.exists(UNAME_FILE):
+    if not os.path.exists(_uname_file_location):
 
-        username = qhue.create_new_username(BRIDGE_IP)
+        username = qhue.create_new_username(_bridge_ip)
 
-        with open(UNAME_FILE, 'w') as f:
+        with open(_uname_file_location, 'w') as f:
             f.write(username)
 
     else:
 
-        with open(UNAME_FILE, 'r') as f:
+        with open(_uname_file_location, 'r') as f:
             username = f.read()
 
-    b = qhue.Bridge(BRIDGE_IP, username)
+    b = qhue.Bridge(_bridge_ip, username)
 
     lights = b.lights
 

@@ -1,127 +1,30 @@
 from collections import namedtuple
 import numpy as np
-from qhue import QhueException
+from qhue import QhueException, Bridge
+import quickstart
 
-def cp(x, y):
-    return np.array((x, y))
 
-Gamut = namedtuple('Gamut', ('red', 'green', 'blue', 'constants'))
+class HueTransmitter (object):
+    """Send commands to hue lamps through this interface."""
+    def __init__(self, bridge_info=None, ttime=None):
+        """Initialize a transmitter, but don't start it yet."""
+        if bridge_info is None:
+            self.bridge, _ = quickstart.quickstart()
+        else:
+            self.bridge = Bridge(*bridge_info)
+        self.lamps = get_lamps(self.bridge)
+        if ttime is not None:
+            for lamp in self.lamps:
+                lamp.ttime = ttime
 
-# include constants for checking if colors are in gamut
-def _make_gamut(red, green, blue):
-    v0 = green - red
-    v1 = blue - red
-    dot00 = np.dot(v0, v0)
-    dot01 = np.dot(v0, v1)
-    dot11 = np.dot(v1, v1)
-    inv_denom = 1. / (dot00 * dot11 - dot01 * dot01)
-    return Gamut(
-        red=red,
-        green=green,
-        blue=blue,
-        constants=(v0, v1, dot00, dot01, dot11, inv_denom))
+    def send_color(self, lamp_name, color_rgb, ttime=None):
+        self.lamps[lamp_name].send_color(color_rgb, ttime)
 
-# living colors, etc
-GAMUT_A = _make_gamut(
-    red=cp(0.704, 0.296),
-    green=cp(0.2151, 0.7106),
-    blue=cp(0.138, 0.08))
+    def send_ct(self, lamp_name, ct, ttime=None):
+        self.lamps[lamp_name].send_ct(ct, ttime)
 
-# hue
-GAMUT_B = _make_gamut(
-    red=cp(0.675, 0.322),
-    green=cp(0.409, 0.518),
-    blue=cp(0.167, 0.04))
-
-def xy_color_in_gamut(color, gamut):
-    """Return True if the color with coordinates x,y is in gamut.
-
-    From the linear algebraic basis method at
-    http://www.blackpawn.com/texts/pointinpoly/
-    """
-    v0, v1, d00, d01, d11, inv_denom = gamut.constants
-    v2 = color - gamut.red
-    d02 = np.dot(v0, v2)
-    d12 = np.dot(v1, v2)
-
-    u = (d11 * d02 - d01 + d12) * inv_denom
-    v = (d00 * d12 - d01 * d02) * inv_denom
-
-    return u >= 0. and v >= 0. and u + v < 1.
-
-def distance(A, B):
-    D = A - B
-    return np.sqrt(np.dot(D, D))
-
-def closest_point_on_line(line, P):
-    """Get the point on the line closest to P.
-
-    Direct port from hue color conversion docs.
-    """
-    A, B = line
-    AB = B - A
-    ab2 = np.dot(AB, AB)
-    ap_ab = np.dot(P - A, AB)
-
-    t = ap_ab / ab2
-
-    t = max(min(t, 1.0), 0.0)
-
-    return (A + AB) * t
-
-def get_closest_color_in_gamut(color, gamut):
-
-    def get_best_point_for_line(line):
-        pAB = closest_point_on_line(line, color)
-        return pAB, distance(color, pAB)
-
-    lines = (
-        (gamut.red, gamut.green),
-        (gamut.blue, gamut.red),
-        (gamut.green, gamut.blue))
-
-    bests = (get_best_point_for_line(line) for line in lines)
-    best_color, _ = min(bests, key=lambda best: best[1])
-    return best_color
-
-def coerce_into_gamut(color, gamut):
-    """Coerce an XY color into gamut, if necessary."""
-    if not xy_color_in_gamut(color, gamut):
-        return get_closest_color_in_gamut(color, gamut)
-    else:
-        return color
-
-def gamma_correction(value):
-    """Perform hue-recommended gamma correction on a unipolar float."""
-    if value > 0.04045:
-        return ((value + 0.055) / 1.055)**2.4
-    else:
-        return value / 12.92
-
-def rgb_to_xy(color_rgb, gamut, gamma_correct=True):
-    """Convert an RGB color to an in-gamut XY color and brightness.
-
-    Direct port from hue color conversion docs.
-    """
-    if gamma_correct:
-        red, green, blue = (gamma_correction(c) for c in color_rgb)
-    else:
-        red, green, blue = color_rgb
-
-    # convert to XYZ using Wide RGB D65
-    X = red * 0.664511 + green * 0.154324 + blue * 0.162028
-    Y = red * 0.283881 + green * 0.668433 + blue * 0.047685
-    Z = red * 0.000088 + green * 0.072310 + blue * 0.986039
-
-    div = X + Y + Z
-    if div == 0.:
-        color_xy = cp(0., 0.)
-    else:
-        color_xy = cp(X / div, Y / div)
-
-    color_xy = coerce_into_gamut(color_xy, gamut)
-
-    return color_xy, Y
+    def send_bri(self, lamp_name, bri, ttime=None):
+        self.lamps[lamp_name].send_bri(bri, ttime)
 
 
 # deciseconds, matches the hue default
@@ -135,21 +38,34 @@ class HueLamp (object):
 
     At the moment, gamut B is hardcoded as I don't own any other lamps :)
 
-    Transition time is am attribute of this class, and will be sent with every
+    Transition time is an attribute of this class, and will be sent with every
     command.
     """
 
     # use gamma correction?
     gamma_correct = True
-    gamut = GAMUT_B
 
     def __init__(self, qhue_light):
         self.light = qhue_light
         info = qhue_light()
+        model_id = info['modelid']
+        static_info = dict(info)
+        del static_info['state']
+        self.static_info = static_info
+        try:
+            self.light_type, self.gamut = TYPE_AND_GAMUT_BY_MODEL_ID[model_id]
+        except KeyError:
+            print "Unknown model id: {}".format(model_id)
+            self.light_type, self.gamut = ('Unknown', GAMUT_B)
+
         self.name = info['name']
         self.ttime = _DEFAULT_TRANSITION_TIME
         self.state = {}
         self.refresh_state(info['state'])
+
+    def __repr__(self):
+        return "<{}: name='{}' state={}>".format(
+            self.light_type, self.name, self.state)
 
     @property
     def xy(self):
@@ -285,3 +201,153 @@ class HueLamp (object):
         """
         bri = int(bri_float*255)
         self.send_command(bri=bri, transitiontime=ttime)
+
+def get_lamps(bridge):
+    """Get a dict of HueLamp objects keyed by name."""
+    qlights = (bridge.lights[number] for number in bridge.lights().keys())
+    huelamps = (HueLamp(qlight) for qlight in qlights)
+    return {lamp.name: lamp for lamp in huelamps}
+
+def cp(x, y):
+    return np.array((x, y))
+
+Gamut = namedtuple('Gamut', ('red', 'green', 'blue', 'constants'))
+
+# include constants for checking if colors are in gamut
+def _make_gamut(red, green, blue):
+    v0 = green - red
+    v1 = blue - red
+    dot00 = np.dot(v0, v0)
+    dot01 = np.dot(v0, v1)
+    dot11 = np.dot(v1, v1)
+    inv_denom = 1. / (dot00 * dot11 - dot01 * dot01)
+    return Gamut(
+        red=red,
+        green=green,
+        blue=blue,
+        constants=(v0, v1, dot00, dot01, dot11, inv_denom))
+
+# living colors, etc
+GAMUT_A = _make_gamut(
+    red=cp(0.704, 0.296),
+    green=cp(0.2151, 0.7106),
+    blue=cp(0.138, 0.08))
+
+# hue
+GAMUT_B = _make_gamut(
+    red=cp(0.675, 0.322),
+    green=cp(0.409, 0.518),
+    blue=cp(0.167, 0.04))
+
+# huestrips and shit
+GAMUT_C = _make_gamut(
+    red=cp(0.692, 0.308),
+    green=cp(0.17, 0.7),
+    blue=cp(0.153, 0.048))
+
+TYPE_AND_GAMUT_BY_MODEL_ID = {
+    'LCT001': ('Hue bulb A19', GAMUT_B),
+    'LCT002': ('Hue Spot BR30', GAMUT_B),
+    'LCT003': ('Hue Spot GU10', GAMUT_B),
+    'LCT007': ('Hue bulb A19', GAMUT_B),
+    'LST001': ('Hue LightStrips', GAMUT_A),
+    'LLC010': ('Hue Living Colors Iris', GAMUT_A),
+    'LLC011': ('Hue Living Colors Bloom', GAMUT_A),
+    'LLC012': ('Hue Living Colors Bloom', GAMUT_A),
+    'LLC013': ('Disney Living Colors', GAMUT_A),
+    'LLM001': ('Color Light Module', GAMUT_B),
+    'LLC020': ('Hue Go', GAMUT_C),
+    'LST002': ('Hue LightStrips Plus', GAMUT_C),
+}
+
+def xy_color_in_gamut(color, gamut):
+    """Return True if the color with coordinates x,y is in gamut.
+
+    From the linear algebraic basis method at
+    http://www.blackpawn.com/texts/pointinpoly/
+    """
+    v0, v1, d00, d01, d11, inv_denom = gamut.constants
+    v2 = color - gamut.red
+    d02 = np.dot(v0, v2)
+    d12 = np.dot(v1, v2)
+
+    u = (d11 * d02 - d01 + d12) * inv_denom
+    v = (d00 * d12 - d01 * d02) * inv_denom
+
+    return u >= 0. and v >= 0. and u + v < 1.
+
+def distance(A, B):
+    D = A - B
+    return np.sqrt(np.dot(D, D))
+
+def closest_point_on_line(line, P):
+    """Get the point on the line closest to P.
+
+    Direct port from hue color conversion docs.
+    """
+    A, B = line
+    AB = B - A
+    ab2 = np.dot(AB, AB)
+    ap_ab = np.dot(P - A, AB)
+
+    t = ap_ab / ab2
+
+    t = max(min(t, 1.0), 0.0)
+
+    return (A + AB) * t
+
+def get_closest_color_in_gamut(color, gamut):
+
+    def get_best_point_for_line(line):
+        pAB = closest_point_on_line(line, color)
+        return pAB, distance(color, pAB)
+
+    lines = (
+        (gamut.red, gamut.green),
+        (gamut.blue, gamut.red),
+        (gamut.green, gamut.blue))
+
+    bests = (get_best_point_for_line(line) for line in lines)
+    best_color, _ = min(bests, key=lambda best: best[1])
+    return best_color
+
+def coerce_into_gamut(color, gamut):
+    """Coerce an XY color into gamut, if necessary."""
+    if not xy_color_in_gamut(color, gamut):
+        return get_closest_color_in_gamut(color, gamut)
+    else:
+        return color
+
+def gamma_correction(value):
+    """Perform hue-recommended gamma correction on a unipolar float."""
+    if value > 0.04045:
+        return ((value + 0.055) / 1.055)**2.4
+    else:
+        return value / 12.92
+
+def rgb_to_xy(color_rgb, gamut, gamma_correct=True):
+    """Convert an RGB color to an in-gamut XY color and brightness.
+
+    Direct port from hue color conversion docs.
+    """
+    if gamma_correct:
+        red, green, blue = (gamma_correction(c) for c in color_rgb)
+    else:
+        red, green, blue = color_rgb
+
+    # convert to XYZ using Wide RGB D65
+    X = red * 0.664511 + green * 0.154324 + blue * 0.162028
+    Y = red * 0.283881 + green * 0.668433 + blue * 0.047685
+    Z = red * 0.000088 + green * 0.072310 + blue * 0.986039
+
+    div = X + Y + Z
+    if div == 0.:
+        color_xy = cp(0., 0.)
+    else:
+        color_xy = cp(X / div, Y / div)
+
+    color_xy = coerce_into_gamut(color_xy, gamut)
+
+    return color_xy, Y
+
+
